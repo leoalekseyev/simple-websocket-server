@@ -22,6 +22,7 @@ import errno
 import codecs
 from collections import deque
 from select import select
+import threading
 
 __all__ = ['WebSocket',
             'SimpleWebSocketServer',
@@ -580,6 +581,9 @@ class SimpleWebSocketServer(object):
       self.selectInterval = selectInterval
       self.connections = {}
       self.listeners = [self.serversocket]
+      self.__is_shut_down = threading.Event()
+      self.__shutdown_request = False
+
 
    def _decorateSocket(self, sock):
       return sock
@@ -597,8 +601,20 @@ class SimpleWebSocketServer(object):
          except:
             pass
 
+   def shutdown(self):
+      self.__shutdown_request = True
+      self.__is_shut_down.wait()
+
    def serveforever(self):
-      while True:
+      self.__is_shut_down.clear()
+      try:
+          self._serveforever()
+      finally:
+          self.__shutdown_request = False
+          self.__is_shut_down.set()
+
+   def _serveforever(self):
+      while not self.__shutdown_request:
          writers = []
          for fileno in self.listeners:
             try:
