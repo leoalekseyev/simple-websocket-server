@@ -1,3 +1,4 @@
+# -*- python-indent: 3; -*-
 '''
 The MIT License (MIT)
 Copyright (c) 2013 Dave P.
@@ -21,8 +22,7 @@ import ssl
 import errno
 import codecs
 from collections import deque
-from select import select
-import threading
+import asyncore
 
 __all__ = ['WebSocket',
             'SimpleWebSocketServer',
@@ -73,12 +73,15 @@ PAYLOAD = 7
 MAXHEADER = 65536
 MAXPAYLOAD = 33554432
 
-class WebSocket(object):
+class WebSocket(asyncore.dispatcher):
 
-   def __init__(self, server, sock, address):
+   def __init__(self, sock, server):
+      asyncore.dispatcher.__init__(self, sock=sock)
       self.server = server
+      self.address = sock.getpeername()
+      print "INSTANTIATING SOCKET"
+
       self.client = sock
-      self.address = address
 
       self.handshaked = False
       self.headerbuffer = bytearray()
@@ -107,6 +110,40 @@ class WebSocket(object):
       # restrict the size of header and payload for security reasons
       self.maxheader = MAXHEADER
       self.maxpayload = MAXPAYLOAD
+      self._readable = True
+
+   def readable(self):
+      return self._readable
+
+   def writable(self):
+      return bool(self.sendq)
+
+   def handle_close(self):
+      print "WEBSOCKET HANDLE_CLOSE"
+      self._readable = False
+      if self.fileno() in self.server.connections:
+         del self.server.connections[self.fileno()]
+      else:
+         print "Connections odesn't have key %s, keys: %s" % (self.fileno(), self.server.connections.keys())
+      asyncore.dispatcher.handle_close(self)
+
+   def handle_read(self):
+      try:
+         self._handleData()
+      except Exception:
+         self.handle_close()
+
+   def handle_write(self):
+      while self.sendq:
+         opcode, payload = self.sendq.popleft()
+         print "Writing %s" % payload
+         remaining = self._sendBuffer(payload)
+         if remaining is not None:
+             self.sendq.appendleft((opcode, remaining))
+             break
+         else:
+             if opcode == CLOSE:
+                raise Exception("received client close")
 
    def handleMessage(self):
       """
@@ -571,19 +608,22 @@ class WebSocket(object):
             self.index += 1
 
 
-class SimpleWebSocketServer(object):
-   def __init__(self, host, port, websocketclass, selectInterval = None):
+class SimpleWebSocketServer(asyncore.dispatcher):
+   def __init__(self, host, port, websocketclass):
       self.websocketclass = websocketclass
-      self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      self.serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-      self.serversocket.bind((host, port))
-      self.serversocket.listen(5)
-      self.selectInterval = selectInterval
+      asyncore.dispatcher.__init__(self)
+      print "INSTANTIATING WS SERVER w/args %s %s %s" % (host, port, websocketclass)
+      self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+      self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      self.bind((host, port))
+      self.listen(5)
       self.connections = {}
-      self.listeners = [self.serversocket]
-      self.__is_shut_down = threading.Event()
-      self.__shutdown_request = False
 
+   def handle_accept(self):
+      print "ACCEPTING"
+      sock, address = self.accept()
+      conn = self.websocketclass(sock=sock, server=self)
+      self.connections[sock.fileno()] = conn
 
    def _decorateSocket(self, sock):
       return sock
@@ -591,142 +631,17 @@ class SimpleWebSocketServer(object):
    def _constructWebSocket(self, sock, address):
       return self.websocketclass(self, sock, address)
 
-   def close(self):
-      self.serversocket.close()
-
-      for desc, conn in self.connections.items():
-         conn.close()
-         try:
-            conn.handleClose()
-         except:
-            pass
+   def handle_close(self):
+      print "SERVER HANDLE_CLOSE"
+      asyncore.dispatcher.handle_close(self)
 
    def shutdown(self):
-      self.__shutdown_request = True
-      self.__is_shut_down.wait()
+      asyncore.close_all()
+      raise asyncore.ExitNow('Server is quitting!')
 
    def serveforever(self):
-      self.__is_shut_down.clear()
-      try:
-          self._serveforever()
-      finally:
-          self.__shutdown_request = False
-          self.__is_shut_down.set()
+      asyncore.loop(timeout=0.1)
 
-   def _serveforever(self):
-      while not self.__shutdown_request:
-         writers = []
-         for fileno in self.listeners:
-            try:
-               client = self.connections[fileno]
-               if client.sendq:
-                  writers.append(fileno)
-            except Exception as n:
-               pass
-
-         if self.selectInterval:
-            rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
-         else:
-            rList, wList, xList = select(self.listeners, writers, self.listeners)
-
-         for ready in wList:
-            client = None
-            try:
-               client = self.connections[ready]
-               while client.sendq:
-                  opcode, payload = client.sendq.popleft()
-                  remaining = client._sendBuffer(payload)
-                  if remaining is not None:
-                      client.sendq.appendleft((opcode, remaining))
-                      break
-                  else:
-                      if opcode == CLOSE:
-                         raise Exception("received client close")
-
-            except Exception as n:
-
-               if client:
-                  client.client.close()
-
-               try:
-                  if client:
-                     client.handleClose()
-               except:
-                  pass
-
-               try:
-                  del self.connections[ready]
-               except:
-                  pass
-
-               try:
-                  self.listeners.remove(ready)
-               except:
-                  pass
-
-         for ready in rList:
-            if ready == self.serversocket:
-               try:
-                  sock, address = self.serversocket.accept()
-                  newsock = self._decorateSocket(sock)
-                  newsock.setblocking(0)
-                  fileno = newsock.fileno()
-                  self.listeners.append(fileno)
-                  self.connections[fileno] = self._constructWebSocket(newsock, address)
-               except Exception as n:
-                  if sock is not None:
-                     sock.close()
-            else:
-               client = None
-               try:
-                  client = self.connections[ready]
-                  client._handleData()
-               except Exception as n:
-                  if client:
-                     client.client.close()
-
-                  try:
-                     if client:
-                        client.handleClose()
-                  except:
-                     pass
-
-                  try:
-                     del self.connections[ready]
-                  except:
-                     pass
-
-                  try:
-                     self.listeners.remove(ready)
-                  except:
-                     pass
-
-         for failed in xList:
-            if failed == self.serversocket:
-               self.close()
-               raise Exception("server socket failed")
-            else:
-               client = None
-               try:
-                   client = self.connections[failed]
-                   client.client.close()
-
-                   try:
-                      client.handleClose()
-                   except:
-                      pass
-
-                   try:
-                      self.listeners.remove(failed)
-                   except:
-                      pass
-
-               except:
-                  pass
-
-               finally:
-                  if client:
-                     del self.connections[failed]
 
 class SimpleSSLWebSocketServer(SimpleWebSocketServer):
 
